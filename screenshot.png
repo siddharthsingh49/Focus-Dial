@@ -1,0 +1,322 @@
+(() => {
+  'use strict';
+
+  // ---------- Config ----------
+  const MIN_MINUTES = 1;
+  const MAX_MINUTES = 60;
+  const GAP_DEG = 12;              // small "off" gap at the top of the dial
+  const CENTER = { x: 160, y: 160 };
+  const RADIUS = 128;
+  const STORAGE_KEY = 'focus-dial-sessions-v1';
+
+  // ---------- Elements ----------
+  const instrument   = document.getElementById('instrument');
+  const dialWrap      = document.querySelector('.dial-wrap');
+  const knob          = document.getElementById('knob');
+  const knobNotch      = document.getElementById('knobNotch');
+  const ticksGroup     = document.getElementById('ticks');
+  const progressArc   = document.getElementById('progressArc');
+  const readoutTime    = document.getElementById('readoutTime');
+  const readoutLabel   = document.getElementById('readoutLabel');
+  const startBtn       = document.getElementById('startBtn');
+  const resetBtn       = document.getElementById('resetBtn');
+  const hint           = document.getElementById('hint');
+  const logList         = document.getElementById('logList');
+  const logEmpty        = document.getElementById('logEmpty');
+  const logTotal        = document.getElementById('logTotal');
+  const clearLogBtn     = document.getElementById('clearLog');
+  const chime          = document.getElementById('chime');
+
+  // ---------- State ----------
+  let minutesSet = 25;
+  let mode = 'idle'; // idle | running | paused | done
+  let remainingSeconds = minutesSet * 60;
+  let intervalId = null;
+
+  // ---------- Geometry helpers ----------
+  // angle: 0 = top (12 o'clock), increases clockwise, max = 360 - GAP_DEG
+  function pointOnCircle(angleDeg, r) {
+    const rad = (angleDeg - 90) * (Math.PI / 180);
+    return {
+      x: CENTER.x + r * Math.cos(rad),
+      y: CENTER.y + r * Math.sin(rad),
+    };
+  }
+
+  function minutesToAngle(m) {
+    const usable = 360 - GAP_DEG;
+    const frac = (m - MIN_MINUTES) / (MAX_MINUTES - MIN_MINUTES);
+    return frac * usable;
+  }
+
+  function angleToMinutes(angle) {
+    const usable = 360 - GAP_DEG;
+    const frac = Math.max(0, Math.min(1, angle / usable));
+    return Math.round(MIN_MINUTES + frac * (MAX_MINUTES - MIN_MINUTES));
+  }
+
+  function buildProgressPath(angleDeg) {
+    if (angleDeg <= 0.001) return '';
+    const start = pointOnCircle(0, RADIUS);
+    const end = pointOnCircle(angleDeg, RADIUS);
+    const largeArc = angleDeg > 180 ? 1 : 0;
+    return `M ${start.x} ${start.y} A ${RADIUS} ${RADIUS} 0 ${largeArc} 1 ${end.x} ${end.y}`;
+  }
+
+  // ---------- Build tick marks (one per minute, major every 5) ----------
+  function buildTicks() {
+    const frag = document.createDocumentFragment();
+    for (let m = MIN_MINUTES; m <= MAX_MINUTES; m++) {
+      const angle = minutesToAngle(m);
+      const isMajor = m % 5 === 0;
+      const outer = pointOnCircle(angle, RADIUS + 10);
+      const inner = pointOnCircle(angle, RADIUS + (isMajor ? 2 : 5));
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', inner.x);
+      line.setAttribute('y1', inner.y);
+      line.setAttribute('x2', outer.x);
+      line.setAttribute('y2', outer.y);
+      line.setAttribute('class', 'tick' + (isMajor ? ' major' : ''));
+      frag.appendChild(line);
+    }
+    ticksGroup.appendChild(frag);
+  }
+
+  // ---------- Render ----------
+  function renderDial() {
+    const angle = minutesToAngle(minutesSet);
+    knobNotch.style.transform = `translateX(-50%) rotate(${angle}deg)`;
+    progressArc.setAttribute('d', buildProgressPath(angle));
+    knob.setAttribute('aria-valuenow', String(minutesSet));
+  }
+
+  function formatClock(totalSeconds) {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+
+  function renderReadout() {
+    if (mode === 'idle') {
+      readoutTime.textContent = `${minutesSet}:00`;
+      readoutLabel.textContent = 'minutes set';
+    } else if (mode === 'running' || mode === 'paused') {
+      readoutTime.textContent = formatClock(remainingSeconds);
+      readoutLabel.textContent = mode === 'running' ? 'remaining' : 'paused';
+    } else if (mode === 'done') {
+      readoutTime.textContent = '00:00';
+      readoutLabel.textContent = 'session complete';
+    }
+  }
+
+  function renderProgressDuringRun() {
+    // Show remaining time as a shrinking arc from full sweep down to 0
+    const totalAngle = minutesToAngle(minutesSet);
+    const frac = remainingSeconds / (minutesSet * 60);
+    progressArc.setAttribute('d', buildProgressPath(totalAngle * frac));
+  }
+
+  // ---------- Sound (no external asset — tiny synthesized chime) ----------
+  function playChime() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const now = ctx.currentTime;
+      [523.25, 659.25, 783.99].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0, now + i * 0.12);
+        gain.gain.linearRampToValueAtTime(0.18, now + i * 0.12 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.12 + 0.9);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now + i * 0.12);
+        osc.stop(now + i * 0.12 + 1);
+      });
+    } catch (e) { /* audio unavailable — silently skip */ }
+  }
+
+  // ---------- Session log (persisted in localStorage) ----------
+  function loadSessions() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) { return []; }
+  }
+
+  function saveSessions(sessions) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); } catch (e) { /* ignore */ }
+  }
+
+  function isToday(iso) {
+    const d = new Date(iso);
+    const now = new Date();
+    return d.toDateString() === now.toDateString();
+  }
+
+  function renderLog() {
+    const sessions = loadSessions().filter(s => isToday(s.at));
+    logList.innerHTML = '';
+    if (sessions.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'log-empty';
+      li.textContent = "No sessions yet — your finished sessions land here.";
+      logList.appendChild(li);
+      logTotal.textContent = '0 min logged';
+      return;
+    }
+    let total = 0;
+    sessions.slice().reverse().forEach(s => {
+      total += s.minutes;
+      const li = document.createElement('li');
+      const time = document.createElement('span');
+      time.className = 'log-entry-time';
+      time.textContent = new Date(s.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const dur = document.createElement('span');
+      dur.className = 'log-entry-dur';
+      dur.textContent = `${s.minutes} min`;
+      li.appendChild(time);
+      li.appendChild(dur);
+      logList.appendChild(li);
+    });
+    logTotal.textContent = `${total} min logged`;
+  }
+
+  function logSession(minutes) {
+    const sessions = loadSessions();
+    sessions.push({ minutes, at: new Date().toISOString() });
+    saveSessions(sessions);
+    renderLog();
+  }
+
+  clearLogBtn.addEventListener('click', () => {
+    saveSessions(loadSessions().filter(s => !isToday(s.at)));
+    renderLog();
+  });
+
+  // ---------- Timer control ----------
+  function setMode(next) {
+    mode = next;
+    instrument.classList.remove('running', 'done');
+    if (mode === 'running') instrument.classList.add('running');
+    if (mode === 'done') instrument.classList.add('done');
+    renderReadout();
+  }
+
+  function startTimer() {
+    if (mode === 'idle' || mode === 'done') {
+      remainingSeconds = minutesSet * 60;
+    }
+    setMode('running');
+    startBtn.textContent = 'Pause';
+    startBtn.classList.add('is-active');
+    hint.textContent = 'Working. The dial unwinds as time passes.';
+    knob.setAttribute('tabindex', '-1');
+
+    intervalId = setInterval(() => {
+      remainingSeconds -= 1;
+      renderProgressDuringRun();
+      renderReadout();
+      if (remainingSeconds <= 0) {
+        clearInterval(intervalId);
+        intervalId = null;
+        setMode('done');
+        startBtn.textContent = 'Start session';
+        startBtn.classList.remove('is-active');
+        hint.textContent = 'Session complete. Turn the knob to start another.';
+        playChime();
+        logSession(minutesSet);
+      }
+    }, 1000);
+  }
+
+  function pauseTimer() {
+    clearInterval(intervalId);
+    intervalId = null;
+    setMode('paused');
+    startBtn.textContent = 'Resume';
+    startBtn.classList.remove('is-active');
+    hint.textContent = 'Paused. Resume whenever you\u2019re ready.';
+  }
+
+  function resetTimer() {
+    clearInterval(intervalId);
+    intervalId = null;
+    remainingSeconds = minutesSet * 60;
+    setMode('idle');
+    startBtn.textContent = 'Start session';
+    startBtn.classList.remove('is-active');
+    hint.textContent = 'Drag the brass knob, or click it and use the arrow keys.';
+    knob.setAttribute('tabindex', '0');
+    renderDial();
+    renderReadout();
+  }
+
+  startBtn.addEventListener('click', () => {
+    if (mode === 'running') pauseTimer();
+    else startTimer();
+  });
+
+  resetBtn.addEventListener('click', resetTimer);
+
+  // ---------- Knob dragging ----------
+  let dragging = false;
+
+  function angleFromPointer(clientX, clientY) {
+    const rect = dialWrap.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+    let deg = Math.atan2(dx, -dy) * (180 / Math.PI); // 0 at top, clockwise positive
+    if (deg < 0) deg += 360;
+    // Clamp out the gap region at the top (map near-360 back toward max)
+    const usable = 360 - GAP_DEG;
+    if (deg > usable) {
+      // snap to nearest edge of the gap
+      deg = (deg - usable < GAP_DEG / 2) ? usable : 0;
+    }
+    return deg;
+  }
+
+  function handlePointerMove(e) {
+    if (!dragging || mode === 'running') return;
+    const point = e.touches ? e.touches[0] : e;
+    const angle = angleFromPointer(point.clientX, point.clientY);
+    minutesSet = angleToMinutes(angle);
+    renderDial();
+    renderReadout();
+  }
+
+  knob.addEventListener('pointerdown', (e) => {
+    if (mode === 'running') return;
+    dragging = true;
+    knob.setPointerCapture(e.pointerId);
+  });
+  knob.addEventListener('pointermove', handlePointerMove);
+  window.addEventListener('pointerup', () => { dragging = false; });
+
+  knob.addEventListener('keydown', (e) => {
+    if (mode === 'running') return;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      minutesSet = Math.min(MAX_MINUTES, minutesSet + 1);
+      renderDial(); renderReadout(); e.preventDefault();
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      minutesSet = Math.max(MIN_MINUTES, minutesSet - 1);
+      renderDial(); renderReadout(); e.preventDefault();
+    }
+  });
+
+  // ---------- Init ----------
+  buildTicks();
+  renderDial();
+  renderReadout();
+  renderLog();
+
+  // Fill in the repo link with the current page location if hosted on GitHub Pages
+  const repoLink = document.getElementById('repoLink');
+  if (location.hostname.endsWith('github.io')) {
+    const [user] = location.hostname.split('.');
+    repoLink.href = `https://github.com/${user}`;
+  }
+})();
